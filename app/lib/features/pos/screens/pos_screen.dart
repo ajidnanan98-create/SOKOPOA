@@ -1,0 +1,1053 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:intl/intl.dart';
+
+import '../../../core/app_theme.dart';
+import '../../inventory/models/product.dart';
+import '../../inventory/repositories/inventory_repository.dart';
+import '../../inventory/services/product_image_storage_service.dart';
+import '../models/sale_cart_item.dart';
+import '../models/sale_payment.dart';
+import '../models/sale_result.dart';
+import '../repositories/pos_read_repository.dart';
+import '../repositories/pos_repository.dart';
+
+class PosScreen extends StatefulWidget {
+  const PosScreen({
+    super.key,
+    required this.cashierUserId,
+    required this.deviceId,
+    this.database,
+  });
+
+  final Database? database;
+  final String cashierUserId;
+  final String deviceId;
+
+  @override
+  State<PosScreen> createState() => _PosScreenState();
+}
+
+class _PosScreenState extends State<PosScreen> {
+  late final InventoryRepository _inventory;
+  late final PosRepository _pos;
+  late final PosReadRepository _read;
+  final _images = ProductImageStorageService();
+
+  final _searchController = TextEditingController();
+  final _discountController = TextEditingController(text: '0');
+  final _paymentController = TextEditingController();
+
+  final _money = NumberFormat.currency(
+    locale: 'en_KE',
+    symbol: 'KES ',
+    decimalDigits: 2,
+  );
+
+  List<Product> _products = [];
+  Map<String, double> _stock = {};
+  List<PosCustomer> _customers = [];
+  List<PosWorker> _workers = [];
+  final List<SaleCartItem> _cart = [];
+
+  PosCustomer? _customer;
+  PosWorker? _worker;
+
+  String _paymentMethod = 'cash';
+  bool _loading = true;
+  bool _processing = false;
+  bool _paymentAutoFilled = true;
+  String? _error;
+
+  int get _subtotal => _cart.fold(0, (sum, item) => sum + item.lineTotalMinor);
+
+  int get _discountMinor {
+    final value = double.tryParse(_discountController.text.trim()) ?? 0;
+    if (!value.isFinite || value <= 0) return 0;
+    return (value * 100).round().clamp(0, _subtotal);
+  }
+
+  int get _total => _subtotal - _discountMinor;
+
+  int get _paidMinor {
+    final value = double.tryParse(_paymentController.text.trim()) ?? 0;
+    if (!value.isFinite || value <= 0) return 0;
+    return (value * 100).round();
+  }
+
+  int get _balance => (_total - _paidMinor).clamp(0, _total);
+
+  @override
+  void initState() {
+    super.initState();
+    _inventory = InventoryRepository(database: widget.database);
+    _pos = PosRepository(database: widget.database);
+    _read = PosReadRepository(database: widget.database);
+    _loadData();
+    _discountController.addListener(_refresh);
+    _paymentController.addListener(_refresh);
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _discountController.dispose();
+    _paymentController.dispose();
+    super.dispose();
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadData({String search = ''}) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      debugPrint(1.toString());
+      final products = await _inventory.getProducts(search: search);
+      debugPrint(2.toString());
+      debugPrint(3.toString());
+      final balances = await _inventory.getStockBalances();
+      debugPrint(4.toString());
+      debugPrint(5.toString());
+      final customers = await _read.getCustomers();
+      debugPrint(6.toString());
+      debugPrint(7.toString());
+      final workers = await _read.getActiveWorkers();
+      debugPrint(8.toString());
+
+      if (!mounted) return;
+
+      setState(() {
+        _products = products.where((product) => product.active).toList();
+        _stock = balances;
+        _customers = customers;
+        _workers = workers;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = error.toString();
+      });
+    }
+  }
+
+  String _format(int minor) => _money.format(minor / 100);
+
+  Future<void> _selectProduct(Product product) async {
+    if (_processing) return;
+
+    try {
+      final units = await _inventory.getProductUnits(product.id);
+
+      if (!mounted) return;
+
+      final options = <_SaleUnit>[
+        _SaleUnit(
+          name: product.baseUnit,
+          factor: 1,
+        ),
+        ...units.where((unit) => unit.baseUnitsPerUnit > 0).map(
+              (unit) => _SaleUnit(
+                name: unit.unitName,
+                factor: unit.baseUnitsPerUnit,
+              ),
+            ),
+      ];
+
+      final uniqueOptions = <String, _SaleUnit>{};
+      for (final option in options) {
+        uniqueOptions[option.name] = option;
+      }
+
+      final selected = await showDialog<_SaleUnit>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('Select unit — ${product.name}'),
+          content: SizedBox(
+            width: 360,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: uniqueOptions.values.map((unit) {
+                final price = (product.sellingPriceMinor * unit.factor).round();
+
+                return ListTile(
+                  title: Text(unit.name),
+                  subtitle: Text(
+                    '${unit.factor} ${product.baseUnit} per unit',
+                  ),
+                  trailing: Text(
+                    _format(price),
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  onTap: () => Navigator.pop(context, unit),
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+      );
+
+      if (selected == null || !mounted) return;
+
+      final available = _stock[product.id] ?? 0;
+      final existingIndex = _cart.indexWhere(
+        (item) =>
+            item.productId == product.id && item.unitName == selected.name,
+      );
+
+      final alreadyInCart =
+          existingIndex >= 0 ? _cart[existingIndex].baseQuantity : 0.0;
+
+      if (available - alreadyInCart < selected.factor) {
+        _showMessage('Insufficient stock for ${product.name}.');
+        return;
+      }
+
+      setState(() {
+        if (existingIndex >= 0) {
+          final current = _cart[existingIndex];
+          _cart[existingIndex] = current.copyWith(
+            quantity: current.quantity + 1,
+          );
+        } else {
+          _cart.add(
+            SaleCartItem(
+              productId: product.id,
+              productName: product.name,
+              unitName: selected.name,
+              quantity: 1,
+              conversionFactor: selected.factor,
+              unitPriceMinor:
+                  (product.sellingPriceMinor * selected.factor).round(),
+              costPerBaseUnitMinor: product.buyingCostMinor,
+            ),
+          );
+        }
+
+        _updateAutomaticPayment();
+      });
+    } catch (error) {
+      _showMessage('Could not load product units: $error');
+    }
+  }
+
+  void _updateAutomaticPayment() {
+    if (_paymentAutoFilled) {
+      _paymentController.text = (_total / 100).toStringAsFixed(2);
+    }
+  }
+
+  void _changeQuantity(int index, double quantity) {
+    if (quantity <= 0) {
+      setState(() {
+        _cart.removeAt(index);
+        _updateAutomaticPayment();
+      });
+      return;
+    }
+
+    final item = _cart[index];
+    final requiredBase = quantity * item.conversionFactor;
+    final otherQuantity = _cart
+        .where((otherIndexItem) => otherIndexItem.productId == item.productId)
+        .fold<double>(
+          0,
+          (sum, other) =>
+              sum + (identical(other, item) ? 0 : other.baseQuantity),
+        );
+
+    final available = _stock[item.productId] ?? 0;
+
+    if (requiredBase + otherQuantity > available + 0.000001) {
+      _showMessage('Quantity exceeds available stock.');
+      return;
+    }
+
+    setState(() {
+      _cart[index] = item.copyWith(quantity: quantity);
+      _updateAutomaticPayment();
+    });
+  }
+
+  void _removeItem(int index) {
+    setState(() {
+      _cart.removeAt(index);
+      _updateAutomaticPayment();
+    });
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<void> _completeSale() async {
+    if (_cart.isEmpty || _processing) {
+      _showMessage('Add products to the cart first.');
+      return;
+    }
+
+    if (_discountMinor > _subtotal) {
+      _showMessage('Discount cannot exceed subtotal.');
+      return;
+    }
+
+    if (_paidMinor > _total) {
+      _showMessage('Payment cannot exceed the sale total.');
+      return;
+    }
+
+    if (_balance > 0 && _customer == null) {
+      _showMessage('Select a customer for the outstanding balance.');
+      return;
+    }
+
+    if (_total <= 0) {
+      _showMessage('Sale total must be greater than zero.');
+      return;
+    }
+
+    setState(() => _processing = true);
+
+    try {
+      final payments = _paidMinor > 0
+          ? [
+              SalePayment(
+                method: _paymentMethod,
+                amountMinor: _paidMinor,
+              ),
+            ]
+          : <SalePayment>[];
+
+      final result = await _pos.completeSale(
+        cartItems: List<SaleCartItem>.from(_cart),
+        payments: payments,
+        cashierUserId: widget.cashierUserId,
+        deviceId: widget.deviceId,
+        customerId: _customer?.id,
+        servedByWorkerId: _worker?.id,
+        discountMinor: _discountMinor,
+      );
+
+      if (!mounted) return;
+
+      await _showReceipt(result);
+
+      if (!mounted) return;
+
+      setState(() {
+        _cart.clear();
+        _customer = null;
+        _worker = null;
+        _discountController.text = '0';
+        _paymentController.clear();
+        _paymentAutoFilled = true;
+        _processing = false;
+      });
+
+      await _loadData(search: _searchController.text);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _processing = false);
+      _showMessage('Sale could not be completed: $error');
+    }
+  }
+
+  Future<void> _showReceipt(SaleResult result) async {
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(
+              Icons.check_circle,
+              color: Theme.of(context).colorScheme.secondary,
+            ),
+            const SizedBox(width: 10),
+            const Text('Sale completed'),
+          ],
+        ),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                result.receiptNumber,
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const Divider(height: 24),
+              _receiptRow('Subtotal', _format(result.subtotalMinor)),
+              _receiptRow('Discount', _format(result.discountMinor)),
+              _receiptRow('Total', _format(result.totalMinor)),
+              _receiptRow('Paid', _format(result.paidMinor)),
+              _receiptRow('Balance', _format(result.balanceMinor)),
+              const SizedBox(height: 12),
+              Text(
+                result.isFullyPaid
+                    ? 'Payment completed'
+                    : 'Outstanding customer balance recorded',
+                style: TextStyle(
+                  color: result.isFullyPaid
+                      ? Theme.of(context).colorScheme.secondary
+                      : Theme.of(context).brightness == Brightness.dark
+                          ? const Color(0xFFFFC266)
+                          : AppTheme.amber,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _receiptRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label),
+          Text(
+            value,
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < 850;
+
+        if (compact) {
+          return Column(
+            children: [
+              _buildSearchBar(),
+              SizedBox(
+                height: constraints.maxHeight * 0.40,
+                child: _buildProductArea(),
+              ),
+              Expanded(
+                child: _buildCartPanel(),
+              ),
+            ],
+          );
+        }
+
+        return Column(
+          children: [
+            _buildSearchBar(),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(
+                    flex: 6,
+                    child: _buildProductArea(),
+                  ),
+                  const VerticalDivider(width: 1),
+                  Expanded(
+                    flex: 5,
+                    child: _buildCartPanel(),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSearchBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: TextField(
+        controller: _searchController,
+        onChanged: (value) => _loadData(search: value),
+        decoration: InputDecoration(
+          hintText: 'Search products by name or code...',
+          prefixIcon: const Icon(Icons.search),
+          suffixIcon: IconButton(
+            tooltip: 'Refresh products',
+            onPressed: () => _loadData(search: _searchController.text),
+            icon: const Icon(Icons.refresh),
+          ),
+          border: const OutlineInputBorder(),
+          isDense: true,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProductArea() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline, size: 36),
+              const SizedBox(height: 10),
+              Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: () => _loadData(
+                  search: _searchController.text,
+                ),
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_products.isEmpty) {
+      return const Center(
+        child: Text('No matching products found.'),
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final columns = (width / 175).floor().clamp(2, 6);
+        final ratio = width < 420 ? 1.10 : 0.90;
+
+        return GridView.builder(
+          padding: const EdgeInsets.all(12),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            childAspectRatio: ratio,
+          ),
+          itemCount: _products.length,
+          itemBuilder: (context, index) {
+            final product = _products[index];
+            final stock = _stock[product.id] ?? 0;
+            final lowStock = stock <= product.minimumQuantity;
+
+            return _ProductTile(
+              product: product,
+              stock: stock,
+              lowStock: lowStock,
+              price: _format(product.sellingPriceMinor),
+              imageService: _images,
+              onTap: stock > 0 ? () => _selectProduct(product) : null,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildCartPanel() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.shopping_cart_outlined),
+              const SizedBox(width: 8),
+              Text(
+                'Current sale (${_cart.length})',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: _cart.isEmpty
+                    ? null
+                    : () {
+                        setState(() {
+                          _cart.clear();
+                          _updateAutomaticPayment();
+                        });
+                      },
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Clear'),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          flex: 2,
+          child: _cart.isEmpty
+              ? const Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.shopping_basket_outlined, size: 40),
+                      SizedBox(height: 8),
+                      Text('Select products to start a sale'),
+                    ],
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  itemCount: _cart.length,
+                  separatorBuilder: (context, index) =>
+                      const Divider(height: 12),
+                  itemBuilder: (context, index) {
+                    final item = _cart[index];
+
+                    return _CartLine(
+                      item: item,
+                      total: _format(item.lineTotalMinor),
+                      onDecrease: () => _changeQuantity(
+                        index,
+                        item.quantity - 1,
+                      ),
+                      onIncrease: () => _changeQuantity(
+                        index,
+                        item.quantity + 1,
+                      ),
+                      onRemove: () => _removeItem(index),
+                    );
+                  },
+                ),
+        ),
+        Expanded(
+          flex: 3,
+          child: _buildCheckout(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCheckout() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border(
+          top: BorderSide(
+            color: Theme.of(context).dividerColor,
+          ),
+        ),
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _totalRow('Subtotal', _format(_subtotal)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _discountController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Discount (KES)',
+                prefixIcon: Icon(Icons.discount_outlined),
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            _totalRow('Total', _format(_total), bold: true),
+            const SizedBox(height: 10),
+            DropdownButtonFormField<PosCustomer?>(
+              initialValue: _customer,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Customer (required for credit)',
+                prefixIcon: Icon(Icons.person_outline),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: [
+                const DropdownMenuItem<PosCustomer?>(
+                  value: null,
+                  child: Text('Walk-in customer'),
+                ),
+                ..._customers.map(
+                  (customer) => DropdownMenuItem<PosCustomer?>(
+                    value: customer,
+                    child: Text(
+                      customer.phone == null || customer.phone!.isEmpty
+                          ? customer.name
+                          : '${customer.name} — ${customer.phone}',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ],
+              onChanged: (value) => setState(() => _customer = value),
+            ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<PosWorker?>(
+              initialValue: _worker,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Served by',
+                prefixIcon: Icon(Icons.badge_outlined),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: [
+                const DropdownMenuItem<PosWorker?>(
+                  value: null,
+                  child: Text('Select worker (optional)'),
+                ),
+                ..._workers.map(
+                  (worker) => DropdownMenuItem<PosWorker?>(
+                    value: worker,
+                    child: Text(
+                      '${worker.fullName} — ${worker.role}',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ],
+              onChanged: (value) => setState(() => _worker = value),
+            ),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              initialValue: _paymentMethod,
+              decoration: const InputDecoration(
+                labelText: 'Payment method',
+                prefixIcon: Icon(Icons.payments_outlined),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: const [
+                DropdownMenuItem(value: 'cash', child: Text('Cash')),
+                DropdownMenuItem(value: 'mpesa', child: Text('M-PESA')),
+                DropdownMenuItem(value: 'card', child: Text('Card')),
+                DropdownMenuItem(value: 'bank', child: Text('Bank')),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  setState(() => _paymentMethod = value);
+                }
+              },
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _paymentController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              onChanged: (_) => _paymentAutoFilled = false,
+              decoration: const InputDecoration(
+                labelText: 'Amount received (KES)',
+                prefixIcon: Icon(Icons.account_balance_wallet_outlined),
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _totalRow(
+              'Outstanding balance',
+              _format(_balance),
+              color: _balance > 0 ? AppTheme.amber : AppTheme.green,
+              bold: true,
+            ),
+            if (_balance > 0 && _customer == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 6),
+                child: Text(
+                  'Select a customer before recording an unpaid balance.',
+                  style: TextStyle(color: AppTheme.danger, fontSize: 12),
+                ),
+              ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 48,
+              child: FilledButton.icon(
+                onPressed: _cart.isEmpty || _processing ? null : _completeSale,
+                icon: _processing
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                        ),
+                      )
+                    : const Icon(Icons.check_circle_outline),
+                label: Text(
+                  _processing ? 'Processing...' : 'Complete sale',
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _totalRow(
+    String label,
+    String value, {
+    bool bold = false,
+    Color? color,
+  }) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontWeight: bold ? FontWeight.w700 : FontWeight.normal,
+          ),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: color,
+            fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+            fontSize: bold ? 16 : 14,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _SaleUnit {
+  const _SaleUnit({
+    required this.name,
+    required this.factor,
+  });
+
+  final String name;
+  final double factor;
+}
+
+class _ProductTile extends StatelessWidget {
+  const _ProductTile({
+    required this.product,
+    required this.stock,
+    required this.lowStock,
+    required this.price,
+    required this.imageService,
+    required this.onTap,
+  });
+
+  final Product product;
+  final double stock;
+  final bool lowStock;
+  final String price;
+  final ProductImageStorageService imageService;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      margin: EdgeInsets.zero,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _ProductImage(
+                  path: product.imagePath,
+                  service: imageService,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                product.name,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                price,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.primary,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Row(
+                children: [
+                  Icon(
+                    lowStock
+                        ? Icons.warning_amber_rounded
+                        : Icons.inventory_2_outlined,
+                    size: 13,
+                    color: lowStock ? AppTheme.amber : AppTheme.green,
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      'Stock: $stock ${product.baseUnit}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: lowStock ? AppTheme.amber : null,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ProductImage extends StatelessWidget {
+  const _ProductImage({
+    required this.path,
+    required this.service,
+  });
+
+  final String? path;
+  final ProductImageStorageService service;
+
+  @override
+  Widget build(BuildContext context) {
+    if (path == null || path!.isEmpty) {
+      return _placeholder(context);
+    }
+
+    return FutureBuilder<File?>(
+      future: service.resolveImageFile(path),
+      builder: (context, snapshot) {
+        final file = snapshot.data;
+
+        if (file == null || !file.existsSync()) {
+          return _placeholder(context);
+        }
+
+        return Image.file(
+          file,
+          fit: BoxFit.contain,
+          errorBuilder: (context, error, stackTrace) => _placeholder(context),
+        );
+      },
+    );
+  }
+
+  Widget _placeholder(BuildContext context) {
+    return Container(
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Icon(
+        Icons.inventory_2_outlined,
+        size: 34,
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+}
+
+class _CartLine extends StatelessWidget {
+  const _CartLine({
+    required this.item,
+    required this.total,
+    required this.onDecrease,
+    required this.onIncrease,
+    required this.onRemove,
+  });
+
+  final SaleCartItem item;
+  final String total;
+  final VoidCallback onDecrease;
+  final VoidCallback onIncrease;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                item.productName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              Text(
+                '${item.unitName} · $total',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          tooltip: 'Decrease quantity',
+          visualDensity: VisualDensity.compact,
+          onPressed: onDecrease,
+          icon: const Icon(Icons.remove_circle_outline),
+        ),
+        Text(
+          item.quantity.toStringAsFixed(
+            item.quantity == item.quantity.roundToDouble() ? 0 : 2,
+          ),
+        ),
+        IconButton(
+          tooltip: 'Increase quantity',
+          visualDensity: VisualDensity.compact,
+          onPressed: onIncrease,
+          icon: const Icon(Icons.add_circle_outline),
+        ),
+        IconButton(
+          tooltip: 'Remove item',
+          visualDensity: VisualDensity.compact,
+          onPressed: onRemove,
+          icon: const Icon(Icons.close, size: 18),
+        ),
+      ],
+    );
+  }
+}

@@ -1,0 +1,11 @@
+# Security checklist before production
+- Use HTTPS only for all remote API traffic.
+- Store password hashes using Argon2id; never store plaintext passwords.
+- Replace the Phase 1 in-memory auth placeholder with PostgreSQL-backed users and JWT rotation.
+- Enforce business/tenant scoping on every query.
+- Enforce role and permission checks on the backend, not only in the UI.
+- Use short-lived access tokens and revocable refresh sessions.
+- Register devices and allow the owner to revoke them.
+- Keep secrets in environment variables/secret manager; never commit `.env`.
+- Require owner to change the bootstrap password on first login.
+- Add rate limits, login throttling, audit events and backup encryption.

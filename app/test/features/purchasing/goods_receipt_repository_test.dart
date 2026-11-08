@@ -1,0 +1,1052 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'package:sokopoa/features/purchasing/repositories/purchase_order_repository.dart';
+import 'package:sokopoa/features/purchasing/repositories/goods_receipt_repository.dart';
+
+void main() {
+  late Database database;
+  late PurchaseOrderRepository purchaseRepository;
+  late GoodsReceiptRepository receiptRepository;
+
+  const actor = 'test-user';
+  const device = 'test-device';
+  const supplierId = 'supplier-001';
+  const productId = 'product-001';
+
+  setUpAll(() {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  });
+
+  setUp(() async {
+    database = await databaseFactory.openDatabase(
+      inMemoryDatabasePath,
+      options: OpenDatabaseOptions(
+        version: 5,
+        onConfigure: (db) async {
+          await db.execute('PRAGMA foreign_keys = ON');
+        },
+        onCreate: (db, version) async {
+          await db.execute('''
+            CREATE TABLE suppliers (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              phone TEXT,
+              email TEXT,
+              address TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              sync_state TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE products (
+              id TEXT PRIMARY KEY,
+              code TEXT UNIQUE,
+              name TEXT NOT NULL,
+              category TEXT,
+              description TEXT,
+              base_unit TEXT NOT NULL,
+              buying_cost_minor INTEGER NOT NULL DEFAULT 0,
+              selling_price_minor INTEGER NOT NULL DEFAULT 0,
+              minimum_quantity REAL NOT NULL DEFAULT 0,
+              active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              sync_state TEXT NOT NULL DEFAULT 'pending',
+              image_path TEXT
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE product_units (
+              id TEXT PRIMARY KEY,
+              product_id TEXT NOT NULL REFERENCES products(id),
+              unit_name TEXT NOT NULL,
+              base_units_per_unit REAL NOT NULL
+                CHECK(base_units_per_unit > 0),
+              UNIQUE(product_id, unit_name)
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE stock_movements (
+              id TEXT PRIMARY KEY,
+              product_id TEXT NOT NULL REFERENCES products(id),
+              movement_type TEXT NOT NULL,
+              quantity_base REAL NOT NULL,
+              unit_name TEXT NOT NULL,
+              entered_quantity REAL NOT NULL DEFAULT 0,
+              conversion_factor REAL NOT NULL DEFAULT 1,
+              reference_type TEXT,
+              reference_id TEXT,
+              reason TEXT,
+              actor_user_id TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              occurred_at TEXT NOT NULL,
+              sync_state TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE purchase_orders (
+              id TEXT PRIMARY KEY,
+              order_number TEXT NOT NULL UNIQUE,
+              supplier_id TEXT NOT NULL REFERENCES suppliers(id),
+              status TEXT NOT NULL DEFAULT 'draft'
+                CHECK(status IN (
+                  'draft',
+                  'ordered',
+                  'partially_received',
+                  'received',
+                  'cancelled'
+                )),
+              ordered_at TEXT,
+              expected_at TEXT,
+              notes TEXT,
+              subtotal_minor INTEGER NOT NULL DEFAULT 0
+                CHECK(subtotal_minor >= 0),
+              discount_minor INTEGER NOT NULL DEFAULT 0
+                CHECK(discount_minor >= 0),
+              total_minor INTEGER NOT NULL DEFAULT 0
+                CHECK(total_minor >= 0),
+              actor_user_id TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              sync_state TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE purchase_order_lines (
+              id TEXT PRIMARY KEY,
+              purchase_order_id TEXT NOT NULL
+                REFERENCES purchase_orders(id) ON DELETE CASCADE,
+              product_id TEXT NOT NULL REFERENCES products(id),
+              product_name TEXT NOT NULL,
+              product_code TEXT,
+              entered_quantity REAL NOT NULL CHECK(entered_quantity > 0),
+              unit_name TEXT NOT NULL,
+              conversion_factor REAL NOT NULL
+                CHECK(conversion_factor > 0),
+              base_quantity REAL NOT NULL CHECK(base_quantity > 0),
+              unit_cost_minor INTEGER NOT NULL
+                CHECK(unit_cost_minor >= 0),
+              line_total_minor INTEGER NOT NULL
+                CHECK(line_total_minor >= 0),
+              created_at TEXT NOT NULL
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE goods_receipts (
+              id TEXT PRIMARY KEY,
+              receipt_number TEXT NOT NULL UNIQUE,
+              purchase_order_id TEXT NOT NULL
+                REFERENCES purchase_orders(id),
+              status TEXT NOT NULL DEFAULT 'draft'
+                CHECK(status IN ('draft', 'posted', 'cancelled')),
+              received_at TEXT NOT NULL,
+              notes TEXT,
+              actor_user_id TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              posted_at TEXT,
+              sync_state TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE goods_receipt_lines (
+              id TEXT PRIMARY KEY,
+              goods_receipt_id TEXT NOT NULL
+                REFERENCES goods_receipts(id) ON DELETE CASCADE,
+              purchase_order_line_id TEXT NOT NULL
+                REFERENCES purchase_order_lines(id),
+              product_id TEXT NOT NULL REFERENCES products(id),
+              product_name TEXT NOT NULL,
+              entered_quantity REAL NOT NULL CHECK(entered_quantity > 0),
+              unit_name TEXT NOT NULL,
+              conversion_factor REAL NOT NULL
+                CHECK(conversion_factor > 0),
+              received_quantity_base REAL NOT NULL
+                CHECK(received_quantity_base > 0),
+              accepted_quantity_base REAL NOT NULL
+                CHECK(accepted_quantity_base >= 0),
+              damaged_quantity_base REAL NOT NULL
+                CHECK(damaged_quantity_base >= 0),
+              rejected_quantity_base REAL NOT NULL
+                CHECK(rejected_quantity_base >= 0),
+              cost_per_base_unit_minor REAL NOT NULL
+                CHECK(cost_per_base_unit_minor >= 0),
+              created_at TEXT NOT NULL
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE sync_outbox (
+              event_id TEXT PRIMARY KEY,
+              aggregate_type TEXT NOT NULL,
+              aggregate_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              status TEXT NOT NULL DEFAULT 'pending'
+            )
+          ''');
+
+          await db.execute('''
+            CREATE TABLE audit_log (
+              id TEXT PRIMARY KEY,
+              actor_user_id TEXT,
+              device_id TEXT,
+              action TEXT NOT NULL,
+              entity_type TEXT NOT NULL,
+              entity_id TEXT,
+              previous_value_json TEXT,
+              new_value_json TEXT,
+              reason TEXT,
+              occurred_at TEXT NOT NULL
+            )
+          ''');
+        },
+      ),
+    );
+
+    purchaseRepository = PurchaseOrderRepository(database: database);
+    receiptRepository = GoodsReceiptRepository(database: database);
+
+    final now = DateTime.now().toIso8601String();
+
+    await database.insert('suppliers', {
+      'id': supplierId,
+      'name': 'Test Supplier',
+      'created_at': now,
+      'updated_at': now,
+    });
+
+    await database.insert('products', {
+      'id': productId,
+      'code': 'SOAP-001',
+      'name': 'Test Soap',
+      'base_unit': 'piece',
+      'buying_cost_minor': 5000,
+      'selling_price_minor': 7000,
+      'minimum_quantity': 10,
+      'active': 1,
+      'created_at': now,
+      'updated_at': now,
+    });
+
+    await database.insert('product_units', {
+      'id': 'unit-001',
+      'product_id': productId,
+      'unit_name': 'carton',
+      'base_units_per_unit': 24,
+    });
+  });
+
+  tearDown(() async {
+    await database.close();
+  });
+
+  Future<dynamic> createOrder({
+    String orderNumber = 'PO-001',
+    double quantity = 10,
+    String unitName = 'piece',
+    int unitCostMinor = 5000,
+    String selectedProductId = productId,
+  }) async {
+    final order = await purchaseRepository.createPurchaseOrder(
+      orderNumber: orderNumber,
+      supplierId: supplierId,
+      lines: [
+        PurchaseOrderLineInput(
+          productId: selectedProductId,
+          enteredQuantity: quantity,
+          unitName: unitName,
+          unitCostMinor: unitCostMinor,
+        ),
+      ],
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    return purchaseRepository.markPurchaseOrderOrdered(
+      purchaseOrderId: order.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+  }
+
+  Future<dynamic> createReceipt({
+    required String purchaseOrderId,
+    String receiptNumber = 'GR-001',
+    String purchaseOrderLineId = '',
+    double enteredQuantity = 5,
+    double accepted = 5,
+    double damaged = 0,
+    double rejected = 0,
+  }) async {
+    final orderLines = await purchaseRepository.getPurchaseOrderLines(
+      purchaseOrderId,
+    );
+
+    return receiptRepository.createGoodsReceipt(
+      receiptNumber: receiptNumber,
+      purchaseOrderId: purchaseOrderId,
+      lines: [
+        GoodsReceiptLineInput(
+          purchaseOrderLineId: purchaseOrderLineId.isEmpty
+              ? orderLines.single.id
+              : purchaseOrderLineId,
+          enteredQuantity: enteredQuantity,
+          acceptedQuantityBase: accepted,
+          damagedQuantityBase: damaged,
+          rejectedQuantityBase: rejected,
+        ),
+      ],
+      actorUserId: actor,
+      deviceId: device,
+    );
+  }
+
+  test('creates a draft receipt without changing stock', () async {
+    final order = await createOrder();
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      enteredQuantity: 5,
+      accepted: 4,
+      damaged: 1,
+    );
+
+    expect(receipt.receiptNumber, 'GR-001');
+    expect(receipt.status, 'draft');
+    expect(receipt.purchaseOrderId, order.id);
+
+    final lines = await receiptRepository.getGoodsReceiptLines(receipt.id);
+
+    expect(lines.length, 1);
+    expect(lines.single.receivedQuantityBase, 5);
+    expect(lines.single.acceptedQuantityBase, 4);
+    expect(lines.single.damagedQuantityBase, 1);
+    expect(lines.single.rejectedQuantityBase, 0);
+
+    expect(await database.query('stock_movements'), isEmpty);
+  });
+
+  test('converts carton receipt quantities into base units', () async {
+    final order = await createOrder(
+      orderNumber: 'PO-CARTON',
+      quantity: 3,
+      unitName: 'carton',
+      unitCostMinor: 120000,
+    );
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      enteredQuantity: 1,
+      accepted: 20,
+      damaged: 4,
+    );
+
+    final lines = await receiptRepository.getGoodsReceiptLines(receipt.id);
+
+    expect(lines.single.unitName, 'carton');
+    expect(lines.single.conversionFactor, 24);
+    expect(lines.single.receivedQuantityBase, 24);
+    expect(lines.single.acceptedQuantityBase, 20);
+    expect(lines.single.damagedQuantityBase, 4);
+    expect(lines.single.costPerBaseUnitMinor, 5000);
+  });
+
+  test('rejects a purchase order that is still a draft', () async {
+    final order = await purchaseRepository.createPurchaseOrder(
+      orderNumber: 'PO-DRAFT',
+      supplierId: supplierId,
+      lines: [
+        const PurchaseOrderLineInput(
+          productId: productId,
+          enteredQuantity: 10,
+          unitName: 'piece',
+          unitCostMinor: 5000,
+        ),
+      ],
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    await expectLater(
+      createReceipt(purchaseOrderId: order.id),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('rejects a purchase order that does not exist', () async {
+    await expectLater(
+      createReceipt(purchaseOrderId: 'missing-order'),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('rejects received quantity exceeding ordered quantity', () async {
+    final order = await createOrder(quantity: 10);
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+        enteredQuantity: 11,
+        accepted: 11,
+      ),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('rejects quantities that do not reconcile', () async {
+    final order = await createOrder();
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+        enteredQuantity: 5,
+        accepted: 3,
+        damaged: 1,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('rejects negative accepted, damaged or rejected quantities', () async {
+    final order = await createOrder();
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+        enteredQuantity: 5,
+        accepted: -1,
+        damaged: 6,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('rejects zero or negative received quantity', () async {
+    final order = await createOrder();
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+        enteredQuantity: 0,
+        accepted: 0,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+        receiptNumber: 'GR-NEGATIVE',
+        enteredQuantity: -2,
+        accepted: 0,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('rejects a receipt line from another purchase order', () async {
+    final firstOrder = await createOrder(
+      orderNumber: 'PO-FIRST',
+    );
+
+    final secondOrder = await createOrder(
+      orderNumber: 'PO-SECOND',
+    );
+
+    final firstLines =
+        await purchaseRepository.getPurchaseOrderLines(firstOrder.id);
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: secondOrder.id,
+        purchaseOrderLineId: firstLines.single.id,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('rejects duplicate purchase order lines in one receipt', () async {
+    final order = await createOrder();
+    final lines = await purchaseRepository.getPurchaseOrderLines(order.id);
+
+    await expectLater(
+      receiptRepository.createGoodsReceipt(
+        receiptNumber: 'GR-DUPLICATE',
+        purchaseOrderId: order.id,
+        lines: [
+          GoodsReceiptLineInput(
+            purchaseOrderLineId: lines.single.id,
+            enteredQuantity: 2,
+            acceptedQuantityBase: 2,
+            damagedQuantityBase: 0,
+            rejectedQuantityBase: 0,
+          ),
+          GoodsReceiptLineInput(
+            purchaseOrderLineId: lines.single.id,
+            enteredQuantity: 2,
+            acceptedQuantityBase: 2,
+            damagedQuantityBase: 0,
+            rejectedQuantityBase: 0,
+          ),
+        ],
+        actorUserId: actor,
+        deviceId: device,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+
+    expect(await database.query('goods_receipts'), isEmpty);
+  });
+
+  test('records audit and outbox events when creating a receipt', () async {
+    final order = await createOrder();
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+    );
+
+    final audits = await database.query(
+      'audit_log',
+      where: 'entity_id = ?',
+      whereArgs: [receipt.id],
+    );
+
+    final events = await database.query(
+      'sync_outbox',
+      where: 'aggregate_id = ?',
+      whereArgs: [receipt.id],
+    );
+
+    expect(audits, hasLength(1));
+    expect(audits.single['action'], 'create');
+    expect(audits.single['entity_type'], 'goods_receipt');
+
+    expect(events, hasLength(1));
+    expect(events.single['event_type'], 'goods_receipt.created');
+    expect(events.single['status'], 'pending');
+  });
+
+  test('retrieves receipts belonging to a purchase order', () async {
+    final order = await createOrder();
+
+    final first = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-FIRST',
+    );
+
+    final second = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-SECOND',
+      enteredQuantity: 2,
+      accepted: 2,
+    );
+
+    final receipts = await receiptRepository.getGoodsReceiptsForOrder(order.id);
+
+    expect(receipts, hasLength(2));
+    expect(receipts.map((receipt) => receipt.id), contains(first.id));
+    expect(receipts.map((receipt) => receipt.id), contains(second.id));
+  });
+
+  test('rejects duplicate receipt numbers', () async {
+    final order = await createOrder();
+
+    await createReceipt(
+      purchaseOrderId: order.id,
+    );
+
+    await expectLater(
+      createReceipt(
+        purchaseOrderId: order.id,
+      ),
+      throwsA(anything),
+    );
+
+    expect(await database.query('goods_receipts'), hasLength(1));
+  });
+
+  test('draft receipts do not consume ordered quantity', () async {
+    final order = await createOrder(quantity: 10);
+
+    await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-DRAFT-1',
+      enteredQuantity: 7,
+      accepted: 7,
+    );
+
+    // A second draft can still be created because the first
+    // receipt has not yet been posted.
+    final second = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-DRAFT-2',
+      enteredQuantity: 7,
+      accepted: 7,
+    );
+
+    expect(second.status, 'draft');
+    expect(await database.query('stock_movements'), isEmpty);
+  });
+  test('updates weighted-average cost using accepted quantity only', () async {
+    // Seed 10 pieces of existing stock at KSh 50 each.
+    await database.insert('stock_movements', {
+      'id': 'opening-stock-001',
+      'product_id': productId,
+      'movement_type': 'adjustment_in',
+      'quantity_base': 10,
+      'unit_name': 'piece',
+      'entered_quantity': 10,
+      'conversion_factor': 1,
+      'actor_user_id': actor,
+      'device_id': device,
+      'occurred_at': DateTime.now().toIso8601String(),
+    });
+
+    // New delivery costs KSh 70 per piece.
+    final order = await createOrder(
+      orderNumber: 'PO-WEIGHTED-AVERAGE',
+      quantity: 5,
+      unitCostMinor: 7000,
+    );
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-WEIGHTED-AVERAGE',
+      enteredQuantity: 5,
+      accepted: 3,
+      damaged: 1,
+      rejected: 1,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: receipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    final products = await database.query(
+      'products',
+      where: 'id = ?',
+      whereArgs: [productId],
+    );
+
+    // (10 × 5000 + 3 × 7000) ÷ 13 = 5461.54
+    expect(products.single['buying_cost_minor'], 5462);
+
+    final movements = await database.query(
+      'stock_movements',
+      where: 'product_id = ?',
+      whereArgs: [productId],
+    );
+
+    expect(movements, hasLength(2));
+
+    final totalStock = movements.fold<double>(
+      0,
+      (total, movement) =>
+          total + (movement['quantity_base'] as num).toDouble(),
+    );
+
+    expect(totalStock, 13);
+  });
+  test('blocks posting when existing stock has no recorded buying cost',
+      () async {
+    // Set the existing product cost to zero.
+    await database.update(
+      'products',
+      {'buying_cost_minor': 0},
+      where: 'id = ?',
+      whereArgs: [productId],
+    );
+
+    // Seed 10 pieces of existing stock.
+    await database.insert('stock_movements', {
+      'id': 'opening-stock-zero-cost',
+      'product_id': productId,
+      'movement_type': 'adjustment_in',
+      'quantity_base': 10,
+      'unit_name': 'piece',
+      'entered_quantity': 10,
+      'conversion_factor': 1,
+      'actor_user_id': actor,
+      'device_id': device,
+      'occurred_at': DateTime.now().toIso8601String(),
+    });
+
+    final order = await createOrder(
+      orderNumber: 'PO-ZERO-COST',
+      quantity: 5,
+      unitCostMinor: 7000,
+    );
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-ZERO-COST',
+      enteredQuantity: 5,
+      accepted: 3,
+      damaged: 1,
+      rejected: 1,
+    );
+
+    await expectLater(
+      receiptRepository.postGoodsReceipt(
+        goodsReceiptId: receipt.id,
+        actorUserId: actor,
+        deviceId: device,
+      ),
+      throwsA(isA<StateError>()),
+    );
+
+    // The transaction must leave the receipt as a draft.
+    final receipts = await database.query(
+      'goods_receipts',
+      where: 'id = ?',
+      whereArgs: [receipt.id],
+    );
+
+    expect(receipts.single['status'], 'draft');
+
+    // The original stock movement must be the only movement.
+    final movements = await database.query(
+      'stock_movements',
+      where: 'product_id = ?',
+      whereArgs: [productId],
+    );
+
+    expect(movements, hasLength(1));
+
+    // The product cost must remain zero.
+    final products = await database.query(
+      'products',
+      where: 'id = ?',
+      whereArgs: [productId],
+    );
+
+    expect(products.single['buying_cost_minor'], 0);
+  });
+  test('posting adds only accepted quantities to stock', () async {
+    final order = await createOrder(quantity: 10);
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      enteredQuantity: 5,
+      accepted: 3,
+      damaged: 1,
+      rejected: 1,
+    );
+
+    final posted = await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: receipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    expect(posted.status, 'posted');
+    expect(posted.postedAt, isNotNull);
+
+    final movements = await database.query('stock_movements');
+
+    expect(movements, hasLength(1));
+    expect(movements.single['movement_type'], 'receipt');
+    expect(movements.single['quantity_base'], 3);
+    expect(movements.single['reference_type'], 'goods_receipt');
+    expect(movements.single['reference_id'], receipt.id);
+
+    final orderRows = await database.query(
+      'purchase_orders',
+      where: 'id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(orderRows.single['status'], 'partially_received');
+  });
+
+  test('posting a receipt with zero accepted quantity adds no stock', () async {
+    final order = await createOrder(quantity: 10);
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+      enteredQuantity: 5,
+      accepted: 0,
+      damaged: 3,
+      rejected: 2,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: receipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    expect(await database.query('stock_movements'), isEmpty);
+
+    final orderRows = await database.query(
+      'purchase_orders',
+      where: 'id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(orderRows.single['status'], 'partially_received');
+  });
+
+  test('multiple posted receipts complete a purchase order', () async {
+    final order = await createOrder(quantity: 10);
+
+    final firstReceipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-PART-1',
+      enteredQuantity: 6,
+      accepted: 6,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: firstReceipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    var orderRows = await database.query(
+      'purchase_orders',
+      where: 'id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(orderRows.single['status'], 'partially_received');
+
+    final secondReceipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-PART-2',
+      enteredQuantity: 4,
+      accepted: 4,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: secondReceipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    orderRows = await database.query(
+      'purchase_orders',
+      where: 'id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(orderRows.single['status'], 'received');
+
+    final movements = await database.query('stock_movements');
+
+    expect(movements, hasLength(2));
+
+    final totalStockReceived = movements.fold<double>(
+      0,
+      (total, movement) =>
+          total + (movement['quantity_base'] as num).toDouble(),
+    );
+
+    expect(totalStockReceived, 10);
+  });
+
+  test('posting the same receipt twice is rejected without duplicate stock',
+      () async {
+    final order = await createOrder(quantity: 10);
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: receipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    await expectLater(
+      receiptRepository.postGoodsReceipt(
+        goodsReceiptId: receipt.id,
+        actorUserId: actor,
+        deviceId: device,
+      ),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(await database.query('stock_movements'), hasLength(1));
+  });
+
+  test('posting rechecks remaining quantity against other posted receipts',
+      () async {
+    final order = await createOrder(quantity: 10);
+
+    final firstReceipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-OVER-1',
+      enteredQuantity: 7,
+      accepted: 7,
+    );
+
+    final secondReceipt = await createReceipt(
+      purchaseOrderId: order.id,
+      receiptNumber: 'GR-OVER-2',
+      enteredQuantity: 7,
+      accepted: 7,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: firstReceipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    await expectLater(
+      receiptRepository.postGoodsReceipt(
+        goodsReceiptId: secondReceipt.id,
+        actorUserId: actor,
+        deviceId: device,
+      ),
+      throwsA(isA<StateError>()),
+    );
+
+    final secondReceiptAfterAttempt =
+        await receiptRepository.getGoodsReceiptById(secondReceipt.id);
+
+    expect(secondReceiptAfterAttempt!.status, 'draft');
+    expect(await database.query('stock_movements'), hasLength(1));
+  });
+
+  test('posting creates stock, receipt and purchase order audit events',
+      () async {
+    final order = await createOrder(quantity: 10);
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+    );
+
+    await receiptRepository.postGoodsReceipt(
+      goodsReceiptId: receipt.id,
+      actorUserId: actor,
+      deviceId: device,
+    );
+
+    final receiptEvents = await database.query(
+      'sync_outbox',
+      where: 'aggregate_id = ?',
+      whereArgs: [receipt.id],
+    );
+
+    expect(
+      receiptEvents.any(
+        (event) => event['event_type'] == 'goods_receipt.posted',
+      ),
+      isTrue,
+    );
+
+    final movementEvents = await database.query(
+      'sync_outbox',
+      where: 'aggregate_type = ?',
+      whereArgs: ['stock_movement'],
+    );
+
+    expect(movementEvents, hasLength(1));
+    expect(
+      movementEvents.single['event_type'],
+      'stock.receipt_recorded',
+    );
+
+    final orderEvents = await database.query(
+      'sync_outbox',
+      where: 'aggregate_id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(
+      orderEvents.any(
+        (event) => event['event_type'] == 'purchase_order.partially_received',
+      ),
+      isTrue,
+    );
+
+    final receiptAudits = await database.query(
+      'audit_log',
+      where: 'entity_id = ?',
+      whereArgs: [receipt.id],
+    );
+
+    expect(
+      receiptAudits.any((entry) => entry['action'] == 'post'),
+      isTrue,
+    );
+  });
+
+  test('posting rolls back all changes if stock insertion fails', () async {
+    final order = await createOrder(quantity: 10);
+
+    final receipt = await createReceipt(
+      purchaseOrderId: order.id,
+    );
+
+    await database.execute('''
+      CREATE TRIGGER reject_stock_movement
+      BEFORE INSERT ON stock_movements
+      BEGIN
+        SELECT RAISE(ABORT, 'Test stock insertion failure');
+      END;
+    ''');
+
+    await expectLater(
+      receiptRepository.postGoodsReceipt(
+        goodsReceiptId: receipt.id,
+        actorUserId: actor,
+        deviceId: device,
+      ),
+      throwsA(anything),
+    );
+
+    final receiptAfterAttempt =
+        await receiptRepository.getGoodsReceiptById(receipt.id);
+
+    expect(receiptAfterAttempt!.status, 'draft');
+    expect(await database.query('stock_movements'), isEmpty);
+
+    final orderRows = await database.query(
+      'purchase_orders',
+      where: 'id = ?',
+      whereArgs: [order.id],
+    );
+
+    expect(orderRows.single['status'], 'ordered');
+
+    final postingEvents = await database.query(
+      'sync_outbox',
+      where: 'event_type = ?',
+      whereArgs: ['goods_receipt.posted'],
+    );
+
+    expect(postingEvents, isEmpty);
+  });
+}
